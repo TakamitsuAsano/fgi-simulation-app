@@ -2,24 +2,29 @@ import streamlit as st
 from openai import OpenAI
 import pandas as pd
 import datetime
+import time
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI FGI Simulator", layout="wide")
 
 st.title("👥 AI Focus Group Interview Simulator")
 st.markdown("""
-設定したペルソナ（参加者）とAIモデレーターによるグループインタビューをシミュレーションします。
-日常会話から徐々に深層心理やインサイトを探るように設計されています。
+設定したペルソナとAIモデレーターによるFGIシミュレーションアプリです。
+設定した「所要時間」に合わせて、AIが議論のペース配分（導入→深掘り→まとめ）をコントロールします。
 """)
 
 # --- サイドバー設定 ---
 with st.sidebar:
     st.header("🔧 設定")
     
-    # APIキー入力
-    api_key = st.text_input("OpenAI API Key", type="password")
+    # APIキー設定（Secrets優先、なければ手入力）
+    if "OPENAI_API_KEY" in st.secrets:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    else:
+        api_key = st.text_input("OpenAI API Key", type="password")
+
     if not api_key:
-        st.warning("APIキーを入力してください。")
+        st.warning("APIキーが設定されていません。")
         st.stop()
     
     client = OpenAI(api_key=api_key)
@@ -27,16 +32,19 @@ with st.sidebar:
     # テーマ設定
     topic = st.text_input("インタビューのテーマ", value="新しいコーヒーブランドのコンセプト受容性")
     
-    # モデレーターの設定
-    moderator_style = st.slider("モデレーターの深掘り度（低い＝雑談重視、高い＝分析重視）", 1, 5, 2)
+    # 時間設定（New!）
+    target_duration = st.slider("想定インタビュー時間（分）", 30, 120, 60, step=10)
     
-    # 参加者設定（デフォルト値）
+    # モデレーターの設定
+    moderator_style = st.slider("モデレーターの深掘り度", 1, 5, 2, help="1:雑談重視 ↔ 5:分析重視")
+    
+    # 参加者設定
     default_participants = """
 田中さん: 40歳、既婚、子供1人（7歳小学一年生女子）。キャリアウーマンで年収800万。忙しいが週末は家族との時間を大切にしたい。少し疲れ気味。
 佐藤さん: 28歳、独身、男性。IT企業勤務、年収500万。趣味はキャンプとサウナ。効率重視だが、アナログな体験も好き。
 鈴木さん: 55歳、既婚、子供独立済み。専業主婦。夫と二人暮らし。健康と老後の資金が悩み。時間はたっぷりある。
 """
-    participants_input = st.text_area("参加者プロファイル（名前: 属性 の形式で改行）", value=default_participants.strip(), height=200)
+    participants_input = st.text_area("参加者プロファイル", value=default_participants.strip(), height=200)
 
     # リセットボタン
     if st.button("設定を保存してリセット"):
@@ -55,8 +63,9 @@ with st.sidebar:
 # --- セッション状態の初期化 ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "turn_count" not in st.session_state:
+    st.session_state.turn_count = 0 # ターン数をカウント
 if "participants_data" not in st.session_state:
-    # 初回ロード時の処理
     st.session_state.participants_data = {}
     lines = participants_input.strip().split('\n')
     for line in lines:
@@ -64,10 +73,18 @@ if "participants_data" not in st.session_state:
             name, profile = line.split(":", 1)
             st.session_state.participants_data[name.strip()] = profile.strip()
 
+# --- 計算ロジック: 1ターン＝約5分と仮定 ---
+MINUTES_PER_TURN = 5 
+
+def get_current_progress():
+    """現在の経過時間と進捗率を計算"""
+    current_min = st.session_state.turn_count * MINUTES_PER_TURN
+    progress_pct = min(current_min / target_duration * 100, 100)
+    return current_min, progress_pct
+
 # --- 関数定義 ---
 
 def get_chat_response(system_prompt, user_prompt, model="gpt-3.5-turbo"):
-    """OpenAI APIを呼び出してレスポンスを取得"""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -83,22 +100,35 @@ def get_chat_response(system_prompt, user_prompt, model="gpt-3.5-turbo"):
         return None
 
 def generate_moderator_speak(history, topic, p_data):
-    """モデレーターの発言を生成"""
-    # 参加者リストの文字列化
+    """モデレーターの発言生成（時間管理意識付き）"""
     p_list_str = "\n".join([f"- {name}: {prof}" for name, prof in p_data.items()])
     
+    current_min, progress_pct = get_current_progress()
+    
+    # 進捗に応じた指示
+    time_instruction = ""
+    if progress_pct < 20:
+        time_instruction = "現在は【序盤（アイスブレイク）】です。まだ核心には触れず、参加者の緊張をほぐし、ラポール（信頼関係）を築くための雑談やライトな質問をしてください。"
+    elif progress_pct < 80:
+        time_instruction = "現在は【中盤（深掘り）】です。参加者の回答から「なぜそう思うのか？」という背景や価値観、インサイトを深く掘り下げてください。"
+    else:
+        time_instruction = "現在は【終盤（まとめ）】です。これまでの議論を整理し、言い残したことがないか確認し、インタビューを締めくくる方向へ進めてください。"
+
     system_prompt = f"""
-    あなたは熟練したFGI（Focus Group Interview）のモデレーターです。
+    あなたは熟練したFGIモデレーターです。
     
-    ## 目的
-    テーマ「{topic}」について、参加者から本音や無意識のインサイトを引き出してください。
+    ## テーマ
+    {topic}
     
-    ## 進行のルール
-    1. いきなり核心（インサイト）に触れようとせず、まずは日常会話やアイスブレイクから始めてください。
-    2. 参加者との「距離感」を大切にし、共感を示しながら信頼関係（ラポール）を築いてください。
-    3. 参加者全員にまんべんなく話を振ったり、特定の回答を深掘りしたりしてください。
-    4. 今の段階は「深掘り度レベル: {moderator_style}/5」です（低いほど雑談重視、高いほど核心に迫る）。
-    5. 一度の発言は長すぎないようにし、必ず質問や問いかけで終わってください。
+    ## 時間管理情報
+    - 全体予定時間: {target_duration}分
+    - 現在の経過時間（目安）: {current_min}分
+    - {time_instruction}
+    
+    ## 進行ルール
+    1. 参加者との距離感を大切にする。
+    2. 全員に話を振る、または特定の興味深い発言を深掘りする。
+    3. 一度の発言は長すぎないように。
     
     ## 参加者情報
     {p_list_str}
@@ -108,119 +138,134 @@ def generate_moderator_speak(history, topic, p_data):
     これまでの会話履歴：
     {history}
     
-    今の会話の流れを踏まえて、モデレーターとして次の発言をしてください。
+    現在の状況（{current_min}分経過 / {target_duration}分予定）を踏まえて、モデレーターとして次の発言をしてください。
     """
     
-    return get_chat_response(system_prompt, user_prompt, model="gpt-4o") # モデレーターは賢いモデル推奨
+    return get_chat_response(system_prompt, user_prompt, model="gpt-4o")
 
 def generate_participant_speak(name, profile, history, topic):
-    """参加者の発言を生成"""
+    """参加者の発言生成"""
     system_prompt = f"""
-    あなたは以下のプロファイルを持つ人物になりきってください。
-    
+    あなたは以下のプロファイルを持つ人物です。FGIに参加しています。
     名前: {name}
-    属性・背景: {profile}
+    詳細: {profile}
+    テーマ: {topic}
     
-    あなたは現在、テーマ「{topic}」についてのグループインタビューに参加しています。
-    
-    ## 行動指針
-    1. あなたの属性、年齢、家族構成、悩み、喜びに沿った自然な口調で話してください。
-    2. モデレーターの問いかけに対して答えてください。
-    3. 必要であれば、他の参加者の意見に同意したり、驚いたりしてください。
-    4. AIであることを忘れ、完全にその人間として振る舞ってください。
+    ルール:
+    - プロファイル（年齢、家族、悩み）に基づき、リアルな口調で話す。
+    - 建前だけでなく、徐々に本音を出す。
+    - 短すぎる回答は避け、理由やエピソードを交える。
     """
-    
-    user_prompt = f"""
-    これまでの会話履歴：
-    {history}
-    
-    直前のモデレーターや他の参加者の発言を受けて、あなた（{name}）として発言してください。
-    """
-    
+    user_prompt = f"直前の会話履歴を踏まえ、あなた（{name}）として発言してください。\n履歴:\n{history}"
     return get_chat_response(system_prompt, user_prompt)
 
-# --- メインエリアの表示 ---
+# --- メインエリア ---
 
-# 1. 履歴の表示
+# 進捗バーの表示
+curr_min, prog_pct = get_current_progress()
+st.progress(int(prog_pct))
+st.caption(f"⏱️ 経過時間: 約 {curr_min} 分 / {target_duration} 分 （ターン数: {st.session_state.turn_count}）")
+
+# 1. 履歴表示
 chat_container = st.container()
 with chat_container:
     for msg in st.session_state.messages:
-        role_style = "background-color: #f0f2f6;" if msg["role"] == "Moderator" else ""
-        with st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"] == "Moderator" else "👤"):
-            st.markdown(f"**{msg['role']}**: {msg['content']}")
+        role = msg["role"]
+        avatar = "🧑‍💼" if role == "Moderator" else "👤"
+        with st.chat_message(role, avatar=avatar):
+            st.markdown(f"**{role}**: {msg['content']}")
 
-# 2. 会話進行コントロール
-st.divider()
-col1, col2 = st.columns(2)
-
-# 会話履歴をテキスト化（プロンプト用）
+# 履歴テキスト作成
 history_text = ""
-for msg in st.session_state.messages[-10:]: # 直近10件のみ参照（トークン節約）
+for msg in st.session_state.messages[-15:]:
     history_text += f"{msg['role']}: {msg['content']}\n"
 
+# 2. アクションボタン
+st.divider()
+
+col1, col2, col3 = st.columns(3)
+
+def run_one_cycle():
+    """モデレーター発言 -> 全員回答 の1セットを実行"""
+    # モデレーター
+    mod_text = generate_moderator_speak(history_text, topic, st.session_state.participants_data)
+    if mod_text:
+        st.session_state.messages.append({"role": "Moderator", "content": mod_text})
+        
+        # 参加者（モデレーターの発言を含めた履歴を渡す）
+        current_history = history_text + f"Moderator: {mod_text}\n"
+        for p_name, p_profile in st.session_state.participants_data.items():
+            p_text = generate_participant_speak(p_name, p_profile, current_history, topic)
+            if p_text:
+                st.session_state.messages.append({"role": p_name, "content": p_text})
+                current_history += f"{p_name}: {p_text}\n"
+        
+        # ターン数を加算
+        st.session_state.turn_count += 1
+
 with col1:
-    if st.button("🎙️ モデレーターが発言する", type="primary", use_container_width=True):
-        with st.spinner("モデレーターが考え中..."):
-            mod_text = generate_moderator_speak(history_text, topic, st.session_state.participants_data)
-            if mod_text:
-                st.session_state.messages.append({"role": "Moderator", "content": mod_text})
-                st.rerun()
+    if st.button("🎙️ 1ターン進める (手動)", use_container_width=True):
+        with st.spinner("会話を生成中..."):
+            run_one_cycle()
+            st.rerun()
 
 with col2:
-    if st.button("🗣️ 参加者全員が回答する", use_container_width=True):
-        if not st.session_state.messages or st.session_state.messages[-1]["role"] != "Moderator":
-            st.warning("先にモデレーターに発言させてください。")
-        else:
-            with st.spinner("参加者が回答を作成中..."):
-                # モデレーターの直前の発言を取得
-                latest_history = history_text
+    # 15分相当 = 3ターンと定義
+    if st.button("⏩ 15分一気に進める (自動)", type="primary", use_container_width=True):
+        with st.spinner("15分分の議論をシミュレーション中...（少し時間がかかります）"):
+            for _ in range(3): # 3回ループ
+                # 履歴更新のため再取得
+                temp_hist = ""
+                for msg in st.session_state.messages[-15:]:
+                    temp_hist += f"{msg['role']}: {msg['content']}\n"
                 
-                # 各参加者が順番に（あるいは並列に）発言を生成
-                for p_name, p_profile in st.session_state.participants_data.items():
-                    p_text = generate_participant_speak(p_name, p_profile, latest_history, topic)
-                    if p_text:
-                        st.session_state.messages.append({"role": p_name, "content": p_text})
-                        # 会話履歴を更新して、次の人が前の人の発言も踏まえられるようにする（オプション）
-                        latest_history += f"{p_name}: {p_text}\n"
-                st.rerun()
+                # サイクル実行
+                # ここで関数内のhistory_textは古いままなので、修正が必要だが
+                # 簡易実装としてsession_state経由で回す
+                
+                # モデレーター
+                mod_text = generate_moderator_speak(temp_hist, topic, st.session_state.participants_data)
+                if mod_text:
+                    st.session_state.messages.append({"role": "Moderator", "content": mod_text})
+                    temp_hist += f"Moderator: {mod_text}\n"
+                    
+                    # 参加者
+                    for p_name, p_profile in st.session_state.participants_data.items():
+                        p_text = generate_participant_speak(p_name, p_profile, temp_hist, topic)
+                        if p_text:
+                            st.session_state.messages.append({"role": p_name, "content": p_text})
+                            temp_hist += f"{p_name}: {p_text}\n"
+                    
+                    st.session_state.turn_count += 1
+                    time.sleep(1) # API制限回避のためのwait
+            st.rerun()
 
-# 3. 議事録ダウンロード
-st.divider()
-st.subheader("📝 議事録エクスポート")
-
-if st.session_state.messages:
-    df = pd.DataFrame(st.session_state.messages)
-    # 現在時刻をファイル名に
-    now = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    csv = df.to_csv(index=False).encode('utf-8_sig')
-    
-    st.download_button(
-        label="議事録をCSVでダウンロード",
-        data=csv,
-        file_name=f'fgi_log_{now}.csv',
-        mime='text/csv',
-    )
-
-    # インサイト分析ボタン
-    if st.button("🔍 この時点までのインサイトを分析する"):
-        with st.spinner("会話ログを分析中..."):
+with col3:
+    if st.button("🔍 現時点のインサイト分析", use_container_width=True):
+        with st.spinner("分析中..."):
             all_log = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages])
-            
             insight_prompt = f"""
-            あなたは優秀なマーケティングリサーチャーです。以下のFGIの議事録を読み解き、分析してください。
+            テーマ「{topic}」についてのFGI議事録の分析をお願いします。
             
-            テーマ: {topic}
+            ## 状況
+            現在は開始から{curr_min}分経過した時点です。
             
-            ## 分析してほしい項目
-            1. 参加者の共通する「痛み（Pain）」や「課題」
-            2. 参加者が感じている「喜び（Gain）」や「価値」
-            3. 発言の背景にある心理的要因・インサイト
-            4. 今後のマーケティングへの示唆
+            ## 分析項目
+            1. 議論の主なトピック
+            2. 見えてきたインサイト（未確定でも可）
+            3. モデレーターへのアドバイス（次どこを深掘りすべきか）
             
             ## 議事録
             {all_log}
             """
-            
-            insight = get_chat_response(insight_prompt, "分析をお願いします", model="gpt-4o")
-            st.markdown("### 💡 AIによるインサイト分析結果")
-            st.write(insight)
+            insight = get_chat_response(insight_prompt, "分析してください", model="gpt-4o")
+            st.session_state.messages.append({"role": "System", "content": f"【AI分析】\n{insight}"})
+            st.rerun()
+
+# 3. ダウンロード
+st.divider()
+if st.session_state.messages:
+    df = pd.DataFrame(st.session_state.messages)
+    now = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv = df.to_csv(index=False).encode('utf-8_sig')
+    st.download_button("📝 議事録ダウンロード", data=csv, file_name=f'fgi_log_{now}.csv', mime='text/csv')
