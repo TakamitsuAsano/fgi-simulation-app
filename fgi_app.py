@@ -8,6 +8,7 @@ import time
 st.set_page_config(page_title="AI FGI Simulator", layout="wide")
 
 st.title("👥 AI Focus Group Interview Simulator")
+st.caption("Ver. Realistic: 参加者は忖度せず、自分の生活や金銭感覚に合わなければシビアな意見も述べます。")
 
 # --- セッション状態の初期化 ---
 if "app_phase" not in st.session_state:
@@ -16,8 +17,8 @@ if "app_phase" not in st.session_state:
 # 参加者データ
 if "participants_data" not in st.session_state:
     st.session_state.participants_data = {
-        "田中さん": "40歳、既婚、子供1人（7歳女子）。年収800万。忙しいが週末は家族時間を大切にする。",
-        "佐藤さん": "28歳、独身男性。IT企業、年収500万。キャンプとサウナが好き。効率重視。"
+        "田中さん": "40歳、既婚、子供1人（7歳女子）。年収800万。忙しいが週末は家族時間を大切にする。無駄な出費は嫌い。",
+        "佐藤さん": "28歳、独身男性。IT企業、年収500万。キャンプとサウナが好き。効率重視だが、本当に気に入ったものには金を払う。"
     }
 
 if "strategy_messages" not in st.session_state:
@@ -52,7 +53,7 @@ with st.sidebar:
     
     st.write("---")
     st.subheader("🤖 モデレーター設定")
-    moderator_style = st.slider("深掘り度", 1, 5, 3, help="1:優しく ~ 5:厳しく")
+    moderator_style = st.slider("深掘り度", 1, 5, 3, help="1:優しく ~ 5:厳しく(なぜ買わないかを追求)")
     
     # --- 参加者管理 ---
     st.write("---")
@@ -93,10 +94,11 @@ with st.sidebar:
 def get_chat_response(system_prompt, messages, model="gpt-4o"):
     try:
         api_messages = [{"role": "system", "content": system_prompt}] + messages
+        # 温度パラメータを少し上げて多様性を出す
         response = client.chat.completions.create(
             model=model,
             messages=api_messages,
-            temperature=0.7
+            temperature=0.8 
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -163,11 +165,19 @@ elif st.session_state.app_phase == "interview":
     for msg in st.session_state.interview_messages[-15:]:
         history_text += f"{msg['role']}: {msg['content']}\n"
 
-    # --- モデレーター: 通常発言生成 ---
+    # --- モデレーター生成 (シビア掘り起こし対応) ---
     def generate_moderator_speak_v3(history):
         p_list_str = "\n".join([f"- {name}: {prof}" for name, prof in st.session_state.participants_data.items()])
         time_inst = "序盤" if progress_pct < 20 else "中盤" if progress_pct < 80 else "終盤"
-        style_inst = "共感重視" if moderator_style <= 2 else "追求重視" if moderator_style >= 4 else "バランス重視"
+        
+        # スタイル指示の強化
+        style_inst = ""
+        if moderator_style <= 2:
+            style_inst = "【共感重視】話しやすい雰囲気を作りつつも、「言いにくい本音」がないか優しく聞いてください。"
+        elif moderator_style >= 4:
+            style_inst = "【追求重視】「本当に買いますか？」「建前ではありませんか？」と、購入の障壁となるネガティブな要因をしつこく掘り下げてください。"
+        else:
+            style_inst = "【バランス重視】ポジティブな意見だけでなく、「逆に不満な点」や「買わない理由」も公平に引き出してください。"
         
         system_prompt = f"""
         あなたはFGIモデレーター。
@@ -176,42 +186,56 @@ elif st.session_state.app_phase == "interview":
         事前指示: {strategy_context}
         スタイル: {style_inst} (Lv.{moderator_style})
         参加者: {p_list_str}
+        
+        【重要】
+        参加者が建前で褒めていると感じたら、見逃さずに「でも、実際の生活シーンで本当に使いますか？」と切り込んでください。
         会話の流れに沿って発言せよ。
         """
         user_prompt = f"履歴:\n{history}\n\nモデレーターとして発言してください。"
         return get_chat_response(system_prompt, [{"role": "user", "content": user_prompt}], model="gpt-4o")
 
-    # --- モデレーター: 刺激物提示生成 (New!) ---
+    # --- モデレーター: 刺激物提示生成 ---
     def generate_moderator_presentation(stimulus_type, stimulus_content, history):
         p_list_str = "\n".join([f"- {name}: {prof}" for name, prof in st.session_state.participants_data.items()])
-        style_inst = "共感重視" if moderator_style <= 2 else "追求重視" if moderator_style >= 4 else "バランス重視"
         
         system_prompt = f"""
         あなたはFGIモデレーターです。
+        クライアントから渡された「{stimulus_type}」を提示・説明してください。
         
-        【重要ミッション】
-        クライアント（リサーチャー）から渡された「{stimulus_type}」を参加者に提示・説明し、感想を求めてください。
+        提示内容: {stimulus_content}
         
-        提示する内容:
-        {stimulus_content}
-        
-        スタイル: {style_inst} (Lv.{moderator_style})
-        
-        注意点:
-        - 突然提示するのではなく、会話の流れを少し意識しつつ「さて、ここで〜を見ていただきたいと思います」と切り出してください。
-        - 提示内容をわかりやすく口頭で説明してください。
-        - 最後に「率直にどう思いましたか？」など、スタイルに合わせて問いかけてください。
+        【重要】
+        説明した後、必ず「良い点だけでなく、正直に『ここが嫌だ』『自分なら買わない』と思う点も遠慮なく教えてください」と付け加え、批判的な意見を歓迎する空気を作ってください。
         """
         user_prompt = f"履歴:\n{history}\n\nモデレーターとして上記資料を提示する発言をしてください。"
         return get_chat_response(system_prompt, [{"role": "user", "content": user_prompt}], model="gpt-4o")
 
-    # --- 参加者生成 ---
+    # --- 参加者生成 (リアリティ・シビア対応版) ---
     def generate_participant_speak_v3(name, profile, history):
-        system_prompt = f"あなたはFGI参加者。名前:{name}, 属性:{profile}, テーマ:{topic}。履歴を踏まえ発言せよ。"
+        system_prompt = f"""
+        あなたはAIではなく、FGIに参加している実在の人間として振る舞ってください。
+        名前: {name}
+        属性: {profile}
+        テーマ: {topic}
+        
+        【極めて重要な行動指針】
+        1. **「良い人」を演じないでください**: 
+           あなたの性格や生活スタイル、金銭感覚に合わない提案には、はっきりと（しかし礼儀正しく）「自分には必要ない」「買わない」と言ってください。
+        
+        2. **財布の紐を固くしてください**:
+           「面白い商品だ」と思うことと、「実際にお金を払って買う」ことの間には大きな壁があります。
+           少しでも「高い」「面倒」「今ので十分」と思ったら、購入意向を示さないでください。
+           
+        3. **同調圧力を無視する**:
+           他の参加者が褒めていても、あなたがそう思わなければ、正直に「私はそうは思わない」と発言してください。
+           
+        4. **建前と本音**:
+           「パッケージは素敵ですね（建前）。でも、冷蔵庫に入らないから買いません（本音）」のような、リアルな消費者の反応をしてください。
+        """
         user_prompt = f"履歴:\n{history}\n\n{name}として発言してください。"
         return get_chat_response(system_prompt, [{"role": "user", "content": user_prompt}])
 
-    # --- UI: 刺激物の投入エリア (New!) ---
+    # --- UI: 刺激物の投入エリア ---
     st.markdown("---")
     with st.expander("📺 コンセプト・資料を提示する（刺激物の投入）", expanded=False):
         st.info("議論の途中で、コンセプトボードや動画などの「刺激物」を参加者に見せることができます。")
@@ -224,7 +248,6 @@ elif st.session_state.app_phase == "interview":
                 st.error("内容を入力してください。")
             else:
                 with st.spinner("モデレーターが資料を提示中..."):
-                    # モデレーターが資料提示発言をする
                     mod_text = generate_moderator_presentation(stimulus_type, stimulus_content, history_text)
                     if mod_text:
                         st.session_state.interview_messages.append({"role": "Moderator", "content": f"【資料提示: {stimulus_type}】\n{mod_text}"})
@@ -282,7 +305,7 @@ elif st.session_state.app_phase == "report":
     st.subheader("📊 Phase 3: インサイト分析レポート")
     
     if not st.session_state.analysis_result:
-        with st.spinner("AIリサーチャーが分析中...（提示された資料への反応も含めて分析します）"):
+        with st.spinner("AIリサーチャーが分析中...（シビアな視点で分析します）"):
             full_log = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.interview_messages])
             profiles_str = "\n".join([f"- {name}: {prof}" for name, prof in st.session_state.participants_data.items()])
 
@@ -295,16 +318,16 @@ elif st.session_state.app_phase == "report":
             ## 参加者
             {profiles_str}
             
-            ## 分析のポイント
-            - 議論の途中で「コンセプト」や「資料」が提示されている場合、それに対する**受容性（好き/嫌い）とその理由**を重点的に分析してください。
-            - 表面的な賛同だけでなく、プロファイルに基づく本音や懸念点（インサイト）を発掘してください。
+            ## 分析の重要視点
+            - 参加者の「建前」と「本音」を見抜いてください。
+            - 表面的な評価ではなく、「なぜ買わないのか」「何が購入のハードルになっているか」の阻害要因（Negative Insight）を重点的に抽出してください。
             
             ## 出力構成（マークダウン）
-            1. エグゼクティブ・サマリー
-            2. 提示された刺激物（コンセプト）への反応評価
-            3. 参加者別の深層分析
-            4. 主要インサイト・仮説
-            5. マーケティング提言
+            1. エグゼクティブ・サマリー（忖度なしの結論）
+            2. 提示された刺激物への受容性評価（ポジティブ/ネガティブ）
+            3. 主要な購入阻害要因（Barriers to Purchase）
+            4. 参加者別の深層インサイト
+            5. マーケティング提言（どうすれば買ってもらえるか）
             """
 
             analysis_user_prompt = f"以下の議事録を分析してください:\n\n{full_log}"
