@@ -160,10 +160,10 @@ elif st.session_state.app_phase == "interview":
     # データ準備
     strategy_context = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.strategy_messages])
     history_text = ""
-    for msg in st.session_state.interview_messages[-15:]: # プロンプト用は直近のみ
+    for msg in st.session_state.interview_messages[-15:]:
         history_text += f"{msg['role']}: {msg['content']}\n"
 
-    # 生成関数
+    # --- モデレーター: 通常発言生成 ---
     def generate_moderator_speak_v3(history):
         p_list_str = "\n".join([f"- {name}: {prof}" for name, prof in st.session_state.participants_data.items()])
         time_inst = "序盤" if progress_pct < 20 else "中盤" if progress_pct < 80 else "終盤"
@@ -181,13 +181,58 @@ elif st.session_state.app_phase == "interview":
         user_prompt = f"履歴:\n{history}\n\nモデレーターとして発言してください。"
         return get_chat_response(system_prompt, [{"role": "user", "content": user_prompt}], model="gpt-4o")
 
+    # --- モデレーター: 刺激物提示生成 (New!) ---
+    def generate_moderator_presentation(stimulus_type, stimulus_content, history):
+        p_list_str = "\n".join([f"- {name}: {prof}" for name, prof in st.session_state.participants_data.items()])
+        style_inst = "共感重視" if moderator_style <= 2 else "追求重視" if moderator_style >= 4 else "バランス重視"
+        
+        system_prompt = f"""
+        あなたはFGIモデレーターです。
+        
+        【重要ミッション】
+        クライアント（リサーチャー）から渡された「{stimulus_type}」を参加者に提示・説明し、感想を求めてください。
+        
+        提示する内容:
+        {stimulus_content}
+        
+        スタイル: {style_inst} (Lv.{moderator_style})
+        
+        注意点:
+        - 突然提示するのではなく、会話の流れを少し意識しつつ「さて、ここで〜を見ていただきたいと思います」と切り出してください。
+        - 提示内容をわかりやすく口頭で説明してください。
+        - 最後に「率直にどう思いましたか？」など、スタイルに合わせて問いかけてください。
+        """
+        user_prompt = f"履歴:\n{history}\n\nモデレーターとして上記資料を提示する発言をしてください。"
+        return get_chat_response(system_prompt, [{"role": "user", "content": user_prompt}], model="gpt-4o")
+
+    # --- 参加者生成 ---
     def generate_participant_speak_v3(name, profile, history):
         system_prompt = f"あなたはFGI参加者。名前:{name}, 属性:{profile}, テーマ:{topic}。履歴を踏まえ発言せよ。"
         user_prompt = f"履歴:\n{history}\n\n{name}として発言してください。"
         return get_chat_response(system_prompt, [{"role": "user", "content": user_prompt}])
 
-    # 操作ボタン
-    st.divider()
+    # --- UI: 刺激物の投入エリア (New!) ---
+    st.markdown("---")
+    with st.expander("📺 コンセプト・資料を提示する（刺激物の投入）", expanded=False):
+        st.info("議論の途中で、コンセプトボードや動画などの「刺激物」を参加者に見せることができます。")
+        stimulus_type = st.selectbox("資料の種類", ["コンセプトボード", "動画コンテ", "製品画像", "キャッチコピー", "価格表"])
+        stimulus_content = st.text_area("資料の内容（できるだけ正確に文字で描写してください）", height=100, 
+                                        placeholder="例：『朝専用の無糖コーヒー。カフェイン2倍でシャキッとする。黒いスリムな缶ボトル。価格は150円』というコンセプトボード")
+        
+        if st.button("📢 この資料を提示して議論してもらう"):
+            if not stimulus_content:
+                st.error("内容を入力してください。")
+            else:
+                with st.spinner("モデレーターが資料を提示中..."):
+                    # モデレーターが資料提示発言をする
+                    mod_text = generate_moderator_presentation(stimulus_type, stimulus_content, history_text)
+                    if mod_text:
+                        st.session_state.interview_messages.append({"role": "Moderator", "content": f"【資料提示: {stimulus_type}】\n{mod_text}"})
+                        st.session_state.turn_count += 1
+                        st.rerun()
+
+    # --- UI: 操作ボタン ---
+    st.markdown("---")
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("🎙️ 1ターン進める", use_container_width=True):
@@ -225,7 +270,7 @@ elif st.session_state.app_phase == "interview":
                 st.rerun()
     
     # 終了ボタン
-    st.divider()
+    st.markdown("---")
     st.markdown("### 🏁 セッション終了と分析")
     if st.button("議論を終了し、インサイトを分析する", type="primary", use_container_width=True):
         st.session_state.app_phase = "report"
@@ -236,80 +281,47 @@ elif st.session_state.app_phase == "interview":
 elif st.session_state.app_phase == "report":
     st.subheader("📊 Phase 3: インサイト分析レポート")
     
-    # 分析実行（初回のみ）
     if not st.session_state.analysis_result:
-        with st.spinner("AIリサーチャーが議事録全体とプロファイルを分析中...これには数十秒かかります..."):
-            
-            # 全ログの結合
+        with st.spinner("AIリサーチャーが分析中...（提示された資料への反応も含めて分析します）"):
             full_log = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.interview_messages])
-            
-            # 参加者プロファイル文字列
             profiles_str = "\n".join([f"- {name}: {prof}" for name, prof in st.session_state.participants_data.items()])
 
             analysis_system_prompt = f"""
-            あなたは超一流の定性調査アナリスト（マーケティング・リサーチャー）です。
-            実施されたFGI（Focus Group Interview）のログと、参加者のナラティブなプロファイルを読み込み、
-            「深い洞察（インサイト）」を導き出してください。
+            あなたはFGI分析のプロです。議事録と参加者プロファイルを読み込み、インサイトを導出してください。
             
             ## テーマ
             {topic}
             
-            ## 参加者詳細プロファイル
+            ## 参加者
             {profiles_str}
             
-            ## 定義：ここでの「インサイト」とは
-            単なる発言の要約ではありません。
-            「参加者のプロファイル（属性・背景）」と「発言内容」を掛け合わせ、
-            「なぜ彼らはそう感じるのか？」「表面的な発言の裏にある真の要因は何か？」という
-            **仮説としての洞察**のことです。
+            ## 分析のポイント
+            - 議論の途中で「コンセプト」や「資料」が提示されている場合、それに対する**受容性（好き/嫌い）とその理由**を重点的に分析してください。
+            - 表面的な賛同だけでなく、プロファイルに基づく本音や懸念点（インサイト）を発掘してください。
             
-            ## 出力フォーマット
-            マークダウン形式で出力してください。以下の構成にしてください。
-            
-            1. **エグゼクティブ・サマリー** (全体の結論)
-            2. **参加者別の深層分析** (各人の発言とプロファイルから見える、行動原理や価値観)
-            3. **発見された主要なインサイト・仮説** (3つ〜5つ程度。具体的な「痛み」や「喜び」の源泉)
-            4. **マーケティングへの示唆・提言** (この結果をどう活かすべきか)
+            ## 出力構成（マークダウン）
+            1. エグゼクティブ・サマリー
+            2. 提示された刺激物（コンセプト）への反応評価
+            3. 参加者別の深層分析
+            4. 主要インサイト・仮説
+            5. マーケティング提言
             """
 
-            analysis_user_prompt = f"""
-            以下のFGI議事録全体を分析してください。
-            
-            === 議事録開始 ===
-            {full_log}
-            === 議事録終了 ===
-            """
-            
-            # GPT-4oで分析（長いコンテキストに対応）
+            analysis_user_prompt = f"以下の議事録を分析してください:\n\n{full_log}"
             result = get_chat_response(analysis_system_prompt, [{"role": "user", "content": analysis_user_prompt}], model="gpt-4o")
             st.session_state.analysis_result = result
-            st.rerun() # 再描画して結果を表示
+            st.rerun()
 
-    # 結果表示
     st.markdown(st.session_state.analysis_result)
-    
     st.divider()
     
-    # ダウンロード機能
+    # ダウンロード
     now = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    st.download_button(label="📥 分析レポート (Text)", data=st.session_state.analysis_result, file_name=f'insight_report_{now}.md', mime='text/markdown')
     
-    # 1. 分析レポートDL
-    st.download_button(
-        label="📥 分析レポートをダウンロード (Text)",
-        data=st.session_state.analysis_result,
-        file_name=f'insight_report_{now}.md',
-        mime='text/markdown'
-    )
-    
-    # 2. 議事録DL
     df = pd.DataFrame(st.session_state.interview_messages)
     csv = df.to_csv(index=False).encode('utf-8_sig')
-    st.download_button(
-        label="📥 議事録データをダウンロード (CSV)",
-        data=csv,
-        file_name=f'fgi_log_{now}.csv',
-        mime='text/csv'
-    )
+    st.download_button(label="📥 議事録データ (CSV)", data=csv, file_name=f'fgi_log_{now}.csv', mime='text/csv')
     
     st.divider()
     if st.button("🔄 最初からやり直す（リセット）"):
